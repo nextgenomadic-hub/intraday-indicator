@@ -3,13 +3,13 @@
 // RSI Extreme Scalper BTC v3
 //
 // Same exit math as v2 (TP +0.50 %, SL -0.50 %, R:R 1:1).
-// Adds one filter: HTF trend alignment.
-//   LONG  only if RSI(14) < 15  AND  EMA200(1h) is sloping up
-//   SHORT only if RSI(14) > 85  AND  EMA200(1h) is sloping down
+// Adds one filter: HTF trend alignment via price-vs-EMA200(1h).
+//   LONG  only if RSI(14) < 15  AND  close > EMA200(1h)
+//   SHORT only if RSI(14) > 85  AND  close < EMA200(1h)
 //
-// Hypothesis: RSI extremes WITH the major trend are pullback opportunities;
-// AGAINST the major trend they are continuation moves. The trend filter should
-// drop the systematically-losing counter-trend half.
+// Earlier slope-based check (EMA200 ascending/descending) blocked 100 % of
+// signals because 15m RSI extremes coincide with brief slope inversions even
+// in healthy macro trends. Price-vs-EMA is slower and stable across pullbacks.
 // =============================================================================
 strategy("RSI Extreme Scalper BTC v3",
      overlay                 = true,
@@ -38,14 +38,13 @@ alertSymbol = input.string("BTCUSDT", "Alert Symbol")
 alertTf     = input.string("15m",     "Alert TF Label")
 
 // =============================================================================
-// HTF TREND
+// HTF TREND  (price vs. EMA — survives short pullbacks)
 // =============================================================================
-[htfEma, htfEmaPrev] = request.security(syminfo.tickerid, htfTimeframe,
-     [ta.ema(close, htfEmaLen), ta.ema(close, htfEmaLen)[1]],
-     lookahead = barmerge.lookahead_off)
+htfEma = request.security(syminfo.tickerid, htfTimeframe,
+     ta.ema(close, htfEmaLen), lookahead = barmerge.lookahead_off)
 
-htfUp = htfEma > htfEmaPrev
-htfDn = htfEma < htfEmaPrev
+htfUp = not na(htfEma) and close > htfEma
+htfDn = not na(htfEma) and close < htfEma
 
 // =============================================================================
 // SIGNALS
