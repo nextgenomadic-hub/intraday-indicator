@@ -1,0 +1,110 @@
+//@version=6
+// =============================================================================
+// RSI Extreme Scalper BTC v3
+//
+// Same exit math as v2 (TP +0.50 %, SL -0.50 %, R:R 1:1).
+// Adds one filter: HTF trend alignment.
+//   LONG  only if RSI(14) < 15  AND  EMA200(1h) is sloping up
+//   SHORT only if RSI(14) > 85  AND  EMA200(1h) is sloping down
+//
+// Hypothesis: RSI extremes WITH the major trend are pullback opportunities;
+// AGAINST the major trend they are continuation moves. The trend filter should
+// drop the systematically-losing counter-trend half.
+// =============================================================================
+strategy("RSI Extreme Scalper BTC v3",
+     overlay                 = true,
+     process_orders_on_close = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.04,
+     pyramiding              = 0,
+     calc_on_every_tick      = false)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+rsiLen  = input.int  (14,   "RSI Length",       minval = 2)
+rsiLow  = input.float(15,   "RSI Low  (long)",  minval = 1,    maxval = 50)
+rsiHigh = input.float(85,   "RSI High (short)", minval = 50,   maxval = 99)
+tpPct   = input.float(0.50, "TP %",             minval = 0.01, step   = 0.05)
+slPct   = input.float(0.50, "SL %",             minval = 0.01, step   = 0.05)
+
+htfTimeframe = input.timeframe("60",  "HTF Timeframe")
+htfEmaLen    = input.int      (200,   "HTF EMA Length",  minval = 10)
+
+alertSymbol = input.string("BTCUSDT", "Alert Symbol")
+alertTf     = input.string("15m",     "Alert TF Label")
+
+// =============================================================================
+// HTF TREND
+// =============================================================================
+[htfEma, htfEmaPrev] = request.security(syminfo.tickerid, htfTimeframe,
+     [ta.ema(close, htfEmaLen), ta.ema(close, htfEmaLen)[1]],
+     lookahead = barmerge.lookahead_off)
+
+htfUp = htfEma > htfEmaPrev
+htfDn = htfEma < htfEmaPrev
+
+// =============================================================================
+// SIGNALS
+// =============================================================================
+rsiVal = ta.rsi(close, rsiLen)
+
+longSignal  = rsiVal < rsiLow  and htfUp
+shortSignal = rsiVal > rsiHigh and htfDn
+
+// =============================================================================
+// EXIT LEVELS
+// =============================================================================
+tpLong  = close * (1 + tpPct / 100)
+slLong  = close * (1 - slPct / 100)
+tpShort = close * (1 - tpPct / 100)
+slShort = close * (1 + slPct / 100)
+
+// =============================================================================
+// ORDERS
+// =============================================================================
+if longSignal and strategy.position_size == 0
+    strategy.entry("LONG",  strategy.long)
+    strategy.exit ("XL", from_entry = "LONG",  stop = slLong,  limit = tpLong)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("SHORT", strategy.short)
+    strategy.exit ("XS", from_entry = "SHORT", stop = slShort, limit = tpShort)
+
+// =============================================================================
+// ALERTS  (JSON payload for webhook)
+// =============================================================================
+priceStr   = str.tostring(close,   "#.##")
+slLongStr  = str.tostring(slLong,  "#.##")
+tpLongStr  = str.tostring(tpLong,  "#.##")
+slShortStr = str.tostring(slShort, "#.##")
+tpShortStr = str.tostring(tpShort, "#.##")
+
+if longSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"buy","price":' + priceStr +
+          ',"sl":' + slLongStr + ',"tp":' + tpLongStr +
+          ',"tf":"' + alertTf + '","strategy":"rsi_extreme_btc_v3"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"sell","price":' + priceStr +
+          ',"sl":' + slShortStr + ',"tp":' + tpShortStr +
+          ',"tf":"' + alertTf + '","strategy":"rsi_extreme_btc_v3"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+// =============================================================================
+// PLOTS
+// =============================================================================
+plot(htfEma, "HTF EMA 200 (1h)", color = color.new(color.orange, 0), linewidth = 2)
+
+plotshape(longSignal,  title = "LONG",  location = location.belowbar,
+     color = color.new(color.lime, 0), style = shape.triangleup,   size = size.small, text = "L")
+plotshape(shortSignal, title = "SHORT", location = location.abovebar,
+     color = color.new(color.red,  0), style = shape.triangledown, size = size.small, text = "S")
+
+plot(rsiVal,                 "RSI",         display = display.data_window)
+plot(htfUp ? 1 : 0,          "DBG HTF Up",  display = display.data_window)
+plot(htfDn ? 1 : 0,          "DBG HTF Dn",  display = display.data_window)
