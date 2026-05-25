@@ -1,0 +1,315 @@
+//@version=6
+// =============================================================================
+// RiskGuard Intraday BTC v1.2
+//
+// Changes from v1.1:
+//   - kdjLookback default 3 -> 10  (KDJ cross still in play, much looser window)
+//   - Filter 6 (KDJ) now has enable/disable toggle (default ON)
+//   - Score-based signal: requires >= N of M active filters to pass
+//     (default 6 of 7 instead of strict 7/7)
+//   - Debug panel exposes the live score so the bottleneck filter is visible
+//
+// All thresholds for filters 1-7 inherit v1.1 (relaxed body, S/R) and R:R 1:1.
+// =============================================================================
+strategy("RiskGuard Intraday BTC v1.2",
+     overlay                 = true,
+     process_orders_on_close = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.04,
+     pyramiding              = 0,
+     calc_on_every_tick      = false)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+g_htf = "1. HTF Trend  (Filter 1)"
+g_str = "2. Structure  (Filter 2)"
+g_pb  = "3. Pullback / Candle Body  (Filter 3)"
+g_rsi = "4. RSI  (Filter 4)"
+g_atr = "5. ATR Expansion  (Filter 5)"
+g_kdj = "6. KDJ Cross  (Filter 6)"
+g_sr  = "7. Support / Resistance  (Filter 7)"
+g_sig = "8. Signal Scoring"
+g_ex  = "9. Exit Management"
+g_al  = "10. Alerts"
+g_dbg = "11. Debug"
+
+htfTimeframe = input.timeframe("60",  "HTF Timeframe",       group = g_htf)
+htfEmaLen    = input.int      (200,   "HTF EMA Length",      group = g_htf, minval = 10)
+
+emaStructLen = input.int      (50,    "Structure EMA (15m)", group = g_str, minval = 5)
+
+emaPullLen   = input.int      (21,    "Pullback EMA (15m)",  group = g_pb,  minval = 5)
+bodyMinRatio = input.float    (0.30,  "Min Body / Range",    group = g_pb,  minval = 0.1, maxval = 1.0, step = 0.05)
+
+rsiLen       = input.int      (14,    "RSI Length",          group = g_rsi, minval = 2)
+rsiLongMin   = input.float    (45,    "RSI Long Min",        group = g_rsi)
+rsiLongMax   = input.float    (70,    "RSI Long Max",        group = g_rsi)
+rsiShortMin  = input.float    (30,    "RSI Short Min",       group = g_rsi)
+rsiShortMax  = input.float    (55,    "RSI Short Max",       group = g_rsi)
+
+atrLen       = input.int      (14,    "ATR Length",          group = g_atr, minval = 2)
+atrMaLen     = input.int      (50,    "ATR MA Length",       group = g_atr, minval = 2)
+
+useFilter6Kdj = input.bool    (true,  "Filter 6 (KDJ) Active", group = g_kdj)
+kdjLen        = input.int     (9,     "KDJ Length (N)",        group = g_kdj, minval = 2)
+kdjK          = input.int     (3,     "K Smoothing",           group = g_kdj, minval = 1)
+kdjD          = input.int     (3,     "D Smoothing",           group = g_kdj, minval = 1)
+kdjZone       = input.float   (50,    "K Zone Threshold",      group = g_kdj, tooltip = "Long: K < zone. Short: K > 100 - zone.")
+kdjLookback   = input.int     (10,    "Cross Lookback Bars",   group = g_kdj, minval = 1)
+
+pivotLeft    = input.int      (10,    "Pivot Left",          group = g_sr,  minval = 1)
+pivotRight   = input.int      (5,     "Pivot Right",         group = g_sr,  minval = 1)
+nearMult     = input.float    (1.5,   "Near  (x ATR)",       group = g_sr,  minval = 0.1, step = 0.1)
+farMult      = input.float    (2.0,   "Far   (x ATR)",       group = g_sr,  minval = 0.1, step = 0.1)
+
+minFiltersToPass = input.int  (6,     "Min Filters To Pass", group = g_sig, minval = 1, maxval = 7,
+     tooltip = "Active filters = 7 if KDJ active else 6. Threshold is capped to active count.")
+
+slMult       = input.float    (2.0,   "SL (x ATR)",          group = g_ex,  minval = 0.1, step = 0.1)
+tpMult       = input.float    (2.0,   "TP (x ATR)",          group = g_ex,  minval = 0.1, step = 0.1)
+
+alertTfLabel = input.string   ("15m",     "Alert TF label",  group = g_al)
+alertSymbol  = input.string   ("BTCUSDT", "Alert Symbol",    group = g_al)
+
+showDebug    = input.bool     (true,  "Show Debug Panel",    group = g_dbg)
+
+// =============================================================================
+// FILTER 1 - HTF TREND
+// =============================================================================
+[htfEma, htfEmaPrev] = request.security(syminfo.tickerid, htfTimeframe,
+     [ta.ema(close, htfEmaLen), ta.ema(close, htfEmaLen)[1]],
+     lookahead = barmerge.lookahead_off)
+
+htfUp = htfEma > htfEmaPrev and close > htfEma
+htfDn = htfEma < htfEmaPrev and close < htfEma
+
+// =============================================================================
+// FILTER 2 - 15m STRUCTURE
+// =============================================================================
+emaStruct = ta.ema(close, emaStructLen)
+structUp  = close > emaStruct
+structDn  = close < emaStruct
+
+// =============================================================================
+// FILTER 3 - PULLBACK + CANDLE BODY
+// =============================================================================
+emaPull     = ta.ema(close, emaPullLen)
+touchedPull = low <= emaPull and high >= emaPull
+
+candleRange = high - low
+bodyAbs     = math.abs(close - open)
+bodyRatio   = candleRange > 0 ? bodyAbs / candleRange : 0.0
+
+bullCandle  = close > open and bodyRatio >= bodyMinRatio
+bearCandle  = close < open and bodyRatio >= bodyMinRatio
+
+pullLong    = touchedPull and bullCandle
+pullShort   = touchedPull and bearCandle
+
+// =============================================================================
+// FILTER 4 - RSI BAND
+// =============================================================================
+rsiVal   = ta.rsi(close, rsiLen)
+rsiLong  = rsiVal >= rsiLongMin  and rsiVal <= rsiLongMax
+rsiShort = rsiVal >= rsiShortMin and rsiVal <= rsiShortMax
+
+// =============================================================================
+// FILTER 5 - ATR EXPANSION
+// =============================================================================
+atrVal = ta.atr(atrLen)
+atrMa  = ta.sma(atrVal, atrMaLen)
+atrOk  = atrVal > atrMa
+
+// =============================================================================
+// FILTER 6 - KDJ CROSS  (optional via useFilter6Kdj)
+// =============================================================================
+hh   = ta.highest(high, kdjLen)
+ll   = ta.lowest (low,  kdjLen)
+rng  = hh - ll
+rsv  = rng > 0 ? 100 * (close - ll) / rng : 50.0
+kVal = ta.sma(rsv,  kdjK)
+dVal = ta.sma(kVal, kdjD)
+
+kdjCrossUp = ta.crossover (kVal, dVal) and kVal < kdjZone
+kdjCrossDn = ta.crossunder(kVal, dVal) and kVal > (100 - kdjZone)
+
+bsUp = ta.barssince(kdjCrossUp)
+bsDn = ta.barssince(kdjCrossDn)
+kdjLongOk  = not na(bsUp) and bsUp < kdjLookback
+kdjShortOk = not na(bsDn) and bsDn < kdjLookback
+
+// =============================================================================
+// FILTER 7 - SUPPORT / RESISTANCE
+// =============================================================================
+var float lastPH = na
+var float lastPL = na
+
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow (low,  pivotLeft, pivotRight)
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+distSup = not na(lastPL) ? math.abs(close  - lastPL) : na
+distRes = not na(lastPH) ? math.abs(lastPH - close ) : na
+
+srLong  = not na(distSup) and not na(distRes) and distSup < nearMult * atrVal and distRes > farMult * atrVal
+srShort = not na(distSup) and not na(distRes) and distRes < nearMult * atrVal and distSup > farMult * atrVal
+
+// =============================================================================
+// SIGNAL SCORING  (>= N of M active filters)
+// =============================================================================
+filter6Long  = useFilter6Kdj and kdjLongOk
+filter6Short = useFilter6Kdj and kdjShortOk
+
+longScore  = (htfUp        ? 1 : 0) + (structUp     ? 1 : 0) + (pullLong  ? 1 : 0) +
+             (rsiLong      ? 1 : 0) + (atrOk        ? 1 : 0) + (srLong    ? 1 : 0) +
+             (filter6Long  ? 1 : 0)
+shortScore = (htfDn        ? 1 : 0) + (structDn     ? 1 : 0) + (pullShort ? 1 : 0) +
+             (rsiShort     ? 1 : 0) + (atrOk        ? 1 : 0) + (srShort   ? 1 : 0) +
+             (filter6Short ? 1 : 0)
+
+activeMax    = 6 + (useFilter6Kdj ? 1 : 0)
+effThreshold = math.min(minFiltersToPass, activeMax)
+
+longSignal  = longScore  >= effThreshold
+shortSignal = shortScore >= effThreshold
+
+// =============================================================================
+// EXIT LEVELS  (SL = 2.0 * ATR, TP = 2.0 * ATR  ->  R:R 1:1)
+// =============================================================================
+slLong  = close - slMult * atrVal
+tpLong  = close + tpMult * atrVal
+slShort = close + slMult * atrVal
+tpShort = close - tpMult * atrVal
+
+// =============================================================================
+// ORDERS
+// =============================================================================
+if longSignal and strategy.position_size == 0
+    strategy.entry("LONG",  strategy.long)
+    strategy.exit ("XL", from_entry = "LONG",  stop = slLong,  limit = tpLong)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("SHORT", strategy.short)
+    strategy.exit ("XS", from_entry = "SHORT", stop = slShort, limit = tpShort)
+
+// =============================================================================
+// ALERTS  (JSON payload for webhook)
+// =============================================================================
+priceStr   = str.tostring(close,   "#.##")
+slLongStr  = str.tostring(slLong,  "#.##")
+tpLongStr  = str.tostring(tpLong,  "#.##")
+slShortStr = str.tostring(slShort, "#.##")
+tpShortStr = str.tostring(tpShort, "#.##")
+
+if longSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"buy","price":' + priceStr +
+          ',"sl":' + slLongStr + ',"tp":' + tpLongStr +
+          ',"tf":"' + alertTfLabel + '","strategy":"riskguard_intraday_v1_2"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"sell","price":' + priceStr +
+          ',"sl":' + slShortStr + ',"tp":' + tpShortStr +
+          ',"tf":"' + alertTfLabel + '","strategy":"riskguard_intraday_v1_2"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+// =============================================================================
+// PLOTS
+// =============================================================================
+plot(htfEma,    "HTF EMA 200 (1h)", color = color.new(color.orange, 0), linewidth = 2)
+plot(emaStruct, "Structure EMA 50", color = color.new(color.blue,   0), linewidth = 2)
+plot(emaPull,   "Pullback EMA 21",  color = color.new(color.yellow, 0), linewidth = 1)
+plot(lastPH,    "Resistance",       color = color.new(color.red,   40), linewidth = 1, style = plot.style_linebr)
+plot(lastPL,    "Support",          color = color.new(color.green, 40), linewidth = 1, style = plot.style_linebr)
+
+plotshape(longSignal,  title = "LONG",  location = location.belowbar,
+     color = color.new(color.lime, 0), style = shape.triangleup,   size = size.small, text = "L")
+plotshape(shortSignal, title = "SHORT", location = location.abovebar,
+     color = color.new(color.red,  0), style = shape.triangledown, size = size.small, text = "S")
+
+// =============================================================================
+// DEBUG PANEL
+// =============================================================================
+f_lbl(b) => b ? "OK" : "--"
+f_bg(b)  => b ? color.new(color.green, 70) : color.new(color.red, 80)
+
+var table dbg = table.new(position.top_right, 3, 10,
+     bgcolor      = color.new(color.black, 80),
+     border_width = 1,
+     border_color = color.new(color.gray, 60))
+
+if showDebug and barstate.islast
+    table.cell(dbg, 0, 0, "Filter", bgcolor = color.new(color.black, 30), text_color = color.white)
+    table.cell(dbg, 1, 0, "LONG",   bgcolor = color.new(color.black, 30), text_color = color.white)
+    table.cell(dbg, 2, 0, "SHORT",  bgcolor = color.new(color.black, 30), text_color = color.white)
+
+    table.cell(dbg, 0, 1, "1 HTF Trend",   text_color = color.white)
+    table.cell(dbg, 1, 1, f_lbl(htfUp),     bgcolor = f_bg(htfUp))
+    table.cell(dbg, 2, 1, f_lbl(htfDn),     bgcolor = f_bg(htfDn))
+
+    table.cell(dbg, 0, 2, "2 Structure",   text_color = color.white)
+    table.cell(dbg, 1, 2, f_lbl(structUp),  bgcolor = f_bg(structUp))
+    table.cell(dbg, 2, 2, f_lbl(structDn),  bgcolor = f_bg(structDn))
+
+    table.cell(dbg, 0, 3, "3 Pullback",    text_color = color.white)
+    table.cell(dbg, 1, 3, f_lbl(pullLong),  bgcolor = f_bg(pullLong))
+    table.cell(dbg, 2, 3, f_lbl(pullShort), bgcolor = f_bg(pullShort))
+
+    table.cell(dbg, 0, 4, "4 RSI " + str.tostring(rsiVal, "#.0"), text_color = color.white)
+    table.cell(dbg, 1, 4, f_lbl(rsiLong),   bgcolor = f_bg(rsiLong))
+    table.cell(dbg, 2, 4, f_lbl(rsiShort),  bgcolor = f_bg(rsiShort))
+
+    atrRatio = atrMa > 0 ? atrVal / atrMa : na
+    table.cell(dbg, 0, 5, "5 ATR x" + str.tostring(atrRatio, "#.00"), text_color = color.white)
+    table.cell(dbg, 1, 5, f_lbl(atrOk),     bgcolor = f_bg(atrOk))
+    table.cell(dbg, 2, 5, f_lbl(atrOk),     bgcolor = f_bg(atrOk))
+
+    kdjLabel = useFilter6Kdj ? ("6 KDJ K=" + str.tostring(kVal, "#.0")) : "6 KDJ (off)"
+    table.cell(dbg, 0, 6, kdjLabel, text_color = color.white)
+    table.cell(dbg, 1, 6, useFilter6Kdj ? f_lbl(kdjLongOk)  : "--", bgcolor = useFilter6Kdj ? f_bg(kdjLongOk)  : color.new(color.gray, 60))
+    table.cell(dbg, 2, 6, useFilter6Kdj ? f_lbl(kdjShortOk) : "--", bgcolor = useFilter6Kdj ? f_bg(kdjShortOk) : color.new(color.gray, 60))
+
+    distSupAtr = not na(distSup) and atrVal > 0 ? distSup / atrVal : na
+    distResAtr = not na(distRes) and atrVal > 0 ? distRes / atrVal : na
+    table.cell(dbg, 0, 7, "7 S/R S=" + str.tostring(distSupAtr, "#.0") + "x R=" + str.tostring(distResAtr, "#.0") + "x", text_color = color.white)
+    table.cell(dbg, 1, 7, f_lbl(srLong),    bgcolor = f_bg(srLong))
+    table.cell(dbg, 2, 7, f_lbl(srShort),   bgcolor = f_bg(srShort))
+
+    table.cell(dbg, 0, 8, "SCORE need " + str.tostring(effThreshold) + "/" + str.tostring(activeMax),
+         bgcolor = color.new(color.black, 30), text_color = color.white)
+    table.cell(dbg, 1, 8, str.tostring(longScore)  + "/" + str.tostring(activeMax),
+         bgcolor = longScore  >= effThreshold ? color.new(color.lime, 30) : color.new(color.gray, 70),
+         text_color = color.white)
+    table.cell(dbg, 2, 8, str.tostring(shortScore) + "/" + str.tostring(activeMax),
+         bgcolor = shortScore >= effThreshold ? color.new(color.red,  0)  : color.new(color.gray, 70),
+         text_color = color.white)
+
+    table.cell(dbg, 0, 9, "SIGNAL", bgcolor = color.new(color.black, 30), text_color = color.white)
+    table.cell(dbg, 1, 9, f_lbl(longSignal),  bgcolor = longSignal  ? color.new(color.lime, 0) : color.new(color.gray, 70))
+    table.cell(dbg, 2, 9, f_lbl(shortSignal), bgcolor = shortSignal ? color.new(color.red,  0) : color.new(color.gray, 70))
+
+// Per-bar booleans / scores exposed in the Data Window.
+plot(htfUp        ? 1 : 0, "DBG F1 LONG",  display = display.data_window)
+plot(htfDn        ? 1 : 0, "DBG F1 SHORT", display = display.data_window)
+plot(structUp     ? 1 : 0, "DBG F2 LONG",  display = display.data_window)
+plot(structDn     ? 1 : 0, "DBG F2 SHORT", display = display.data_window)
+plot(pullLong     ? 1 : 0, "DBG F3 LONG",  display = display.data_window)
+plot(pullShort    ? 1 : 0, "DBG F3 SHORT", display = display.data_window)
+plot(rsiLong      ? 1 : 0, "DBG F4 LONG",  display = display.data_window)
+plot(rsiShort     ? 1 : 0, "DBG F4 SHORT", display = display.data_window)
+plot(atrOk        ? 1 : 0, "DBG F5",       display = display.data_window)
+plot(filter6Long  ? 1 : 0, "DBG F6 LONG",  display = display.data_window)
+plot(filter6Short ? 1 : 0, "DBG F6 SHORT", display = display.data_window)
+plot(srLong       ? 1 : 0, "DBG F7 LONG",  display = display.data_window)
+plot(srShort      ? 1 : 0, "DBG F7 SHORT", display = display.data_window)
+plot(longScore,            "DBG SCORE L",  display = display.data_window)
+plot(shortScore,           "DBG SCORE S",  display = display.data_window)
+plot(longSignal   ? 1 : 0, "DBG SIGNAL L", display = display.data_window)
+plot(shortSignal  ? 1 : 0, "DBG SIGNAL S", display = display.data_window)
