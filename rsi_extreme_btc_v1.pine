@@ -1,0 +1,88 @@
+//@version=6
+// =============================================================================
+// RSI Extreme Scalper BTC v1
+//
+// Minimal mean-reversion scalper:
+//   LONG  when RSI(14) < 15
+//   SHORT when RSI(14) > 85
+//   TP = +0.30 % from entry
+//   SL = -1.00 % from entry  (R:R = 0.3 : 1)
+//
+// Asymmetric payoff -> requires very high hit rate to be profitable.
+// Breakeven WR (gross) = 1 / (1 + 0.3) = 76.9 %.
+// =============================================================================
+strategy("RSI Extreme Scalper BTC v1",
+     overlay                 = true,
+     process_orders_on_close = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.04,
+     pyramiding              = 0,
+     calc_on_every_tick      = false)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+rsiLen  = input.int  (14,    "RSI Length",       minval = 2)
+rsiLow  = input.float(15,    "RSI Low  (long)",  minval = 1,    maxval = 50)
+rsiHigh = input.float(85,    "RSI High (short)", minval = 50,   maxval = 99)
+tpPct   = input.float(0.30,  "TP %",             minval = 0.01, step   = 0.05)
+slPct   = input.float(1.00,  "SL %",             minval = 0.01, step   = 0.05)
+
+alertSymbol = input.string("BTCUSDT", "Alert Symbol")
+alertTf     = input.string("15m",     "Alert TF Label")
+
+// =============================================================================
+// LOGIC
+// =============================================================================
+rsiVal = ta.rsi(close, rsiLen)
+
+longSignal  = rsiVal < rsiLow
+shortSignal = rsiVal > rsiHigh
+
+tpLong  = close * (1 + tpPct / 100)
+slLong  = close * (1 - slPct / 100)
+tpShort = close * (1 - tpPct / 100)
+slShort = close * (1 + slPct / 100)
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("LONG",  strategy.long)
+    strategy.exit ("XL", from_entry = "LONG",  stop = slLong,  limit = tpLong)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("SHORT", strategy.short)
+    strategy.exit ("XS", from_entry = "SHORT", stop = slShort, limit = tpShort)
+
+// =============================================================================
+// ALERTS  (JSON payload for webhook)
+// =============================================================================
+priceStr   = str.tostring(close,   "#.##")
+slLongStr  = str.tostring(slLong,  "#.##")
+tpLongStr  = str.tostring(tpLong,  "#.##")
+slShortStr = str.tostring(slShort, "#.##")
+tpShortStr = str.tostring(tpShort, "#.##")
+
+if longSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"buy","price":' + priceStr +
+          ',"sl":' + slLongStr + ',"tp":' + tpLongStr +
+          ',"tf":"' + alertTf + '","strategy":"rsi_extreme_btc_v1"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"sell","price":' + priceStr +
+          ',"sl":' + slShortStr + ',"tp":' + tpShortStr +
+          ',"tf":"' + alertTf + '","strategy":"rsi_extreme_btc_v1"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+// =============================================================================
+// PLOTS
+// =============================================================================
+plotshape(longSignal,  title = "LONG",  location = location.belowbar,
+     color = color.new(color.lime, 0), style = shape.triangleup,   size = size.small, text = "L")
+plotshape(shortSignal, title = "SHORT", location = location.abovebar,
+     color = color.new(color.red,  0), style = shape.triangledown, size = size.small, text = "S")
+
+// RSI value exposed to the Data Window (no on-chart clutter)
+plot(rsiVal, "RSI", display = display.data_window)
