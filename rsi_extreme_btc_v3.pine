@@ -3,13 +3,14 @@
 // RSI Extreme Scalper BTC v3
 //
 // Same exit math as v2 (TP +0.50 %, SL -0.50 %, R:R 1:1).
-// Adds one filter: HTF trend alignment via price-vs-EMA200(1h).
-//   LONG  only if RSI(14) < 15  AND  close > EMA200(1h)
-//   SHORT only if RSI(14) > 85  AND  close < EMA200(1h)
+// Adds one filter: HTF trend alignment via price-vs-EMA200 on the DAILY chart.
+//   LONG  only if RSI(14) < 15  AND  close > EMA200(daily)
+//   SHORT only if RSI(14) > 85  AND  close < EMA200(daily)
 //
-// Earlier slope-based check (EMA200 ascending/descending) blocked 100 % of
-// signals because 15m RSI extremes coincide with brief slope inversions even
-// in healthy macro trends. Price-vs-EMA is slower and stable across pullbacks.
+// Two earlier attempts on 1h failed (slope check and price-vs-1h-EMA) because
+// a 15m RSI extreme implies a sharp 1-3 % drop, enough to push close below the
+// 1h EMA200 and auto-block every signal. EMA200 daily smooths over ~6.6 months
+// and stays well-anchored even through 5 % intraday crashes.
 // =============================================================================
 strategy("RSI Extreme Scalper BTC v3",
      overlay                 = true,
@@ -31,7 +32,7 @@ rsiHigh = input.float(85,   "RSI High (short)", minval = 50,   maxval = 99)
 tpPct   = input.float(0.50, "TP %",             minval = 0.01, step   = 0.05)
 slPct   = input.float(0.50, "SL %",             minval = 0.01, step   = 0.05)
 
-htfTimeframe = input.timeframe("60",  "HTF Timeframe")
+htfTimeframe = input.timeframe("D",   "HTF Timeframe")
 htfEmaLen    = input.int      (200,   "HTF EMA Length",  minval = 10)
 
 alertSymbol = input.string("BTCUSDT", "Alert Symbol")
@@ -97,7 +98,7 @@ if shortSignal
 // =============================================================================
 // PLOTS
 // =============================================================================
-plot(htfEma, "HTF EMA 200 (1h)", color = color.new(color.orange, 0), linewidth = 2)
+plot(htfEma, "HTF EMA 200 (daily)", color = color.new(color.orange, 0), linewidth = 2)
 
 plotshape(longSignal,  title = "LONG",  location = location.belowbar,
      color = color.new(color.lime, 0), style = shape.triangleup,   size = size.small, text = "L")
