@@ -1,13 +1,21 @@
 //@version=6
 // =============================================================================
-// RiskGuard Intraday BTC v1
-// 7-filter chained intraday strategy for BTCUSDT @ 15m
-// Long bias: HTF trend up + 15m structure + pullback to EMA21 + RSI band +
-//            ATR expansion + KDJ cross < 50 + S/R asymmetry
-// Short bias: mirror of the above
-// Exit: SL = 1.5 * ATR, TP = 3.0 * ATR  (R:R = 1:2)
+// RiskGuard Intraday BTC v1.1
+// Same 7-filter chain as v1 with relaxed thresholds and 1:1 R:R, targeting a
+// higher hit rate to compensate the lower per-trade payoff.
+//
+//   Change            v1     v1.1   Rationale
+//   ----------------  -----  -----  ------------------------------------------
+//   Body min ratio    0.40   0.30   Avoid discarding valid pullback candles.
+//   S/R near (xATR)   2.0    1.5    Force entries closer to the swing pivot.
+//   S/R far  (xATR)   3.0    2.0    Realistic room-to-target on 15m BTC.
+//   SL (xATR)         1.5    2.0    More breathing room, fewer wick stops.
+//   TP (xATR)         3.0    2.0    Closer target -> easier to hit.
+//   R:R               1:2    1:1
+//
+// Includes the same on-chart debug panel as v1.
 // =============================================================================
-strategy("RiskGuard Intraday BTC v1",
+strategy("RiskGuard Intraday BTC v1.1",
      overlay                = true,
      process_orders_on_close = true,
      initial_capital        = 10000,
@@ -38,7 +46,7 @@ htfEmaLen    = input.int      (200,   "HTF EMA Length",      group = g_htf, minv
 emaStructLen = input.int      (50,    "Structure EMA (15m)", group = g_str, minval = 5)
 
 emaPullLen   = input.int      (21,    "Pullback EMA (15m)",  group = g_pb,  minval = 5)
-bodyMinRatio = input.float    (0.4,   "Min Body / Range",    group = g_pb,  minval = 0.1, maxval = 1.0, step = 0.05)
+bodyMinRatio = input.float    (0.30,  "Min Body / Range",    group = g_pb,  minval = 0.1, maxval = 1.0, step = 0.05)
 
 rsiLen       = input.int      (14,    "RSI Length",          group = g_rsi, minval = 2)
 rsiLongMin   = input.float    (45,    "RSI Long Min",        group = g_rsi)
@@ -57,13 +65,13 @@ kdjLookback  = input.int      (3,     "Cross Lookback Bars", group = g_kdj, minv
 
 pivotLeft    = input.int      (10,    "Pivot Left",          group = g_sr,  minval = 1)
 pivotRight   = input.int      (5,     "Pivot Right",         group = g_sr,  minval = 1)
-nearMult     = input.float    (2.0,   "Near  (x ATR)",       group = g_sr,  minval = 0.1, step = 0.1)
-farMult      = input.float    (3.0,   "Far   (x ATR)",       group = g_sr,  minval = 0.1, step = 0.1)
+nearMult     = input.float    (1.5,   "Near  (x ATR)",       group = g_sr,  minval = 0.1, step = 0.1)
+farMult      = input.float    (2.0,   "Far   (x ATR)",       group = g_sr,  minval = 0.1, step = 0.1)
 
-slMult       = input.float    (1.5,   "SL (x ATR)",          group = g_ex,  minval = 0.1, step = 0.1)
-tpMult       = input.float    (3.0,   "TP (x ATR)",          group = g_ex,  minval = 0.1, step = 0.1)
+slMult       = input.float    (2.0,   "SL (x ATR)",          group = g_ex,  minval = 0.1, step = 0.1)
+tpMult       = input.float    (2.0,   "TP (x ATR)",          group = g_ex,  minval = 0.1, step = 0.1)
 
-alertTfLabel = input.string   ("15m", "Alert TF label",      group = g_al)
+alertTfLabel = input.string   ("15m",     "Alert TF label",  group = g_al)
 alertSymbol  = input.string   ("BTCUSDT", "Alert Symbol",    group = g_al)
 
 showDebug    = input.bool     (true,  "Show Debug Panel",    group = g_dbg)
@@ -159,7 +167,7 @@ longSignal  = htfUp and structUp and pullLong  and rsiLong  and atrOk and kdjLon
 shortSignal = htfDn and structDn and pullShort and rsiShort and atrOk and kdjShortOk and srShort
 
 // =============================================================================
-// EXIT LEVELS  (SL = 1.5 * ATR, TP = 3.0 * ATR  ->  R:R 1:2)
+// EXIT LEVELS  (SL = 2.0 * ATR, TP = 2.0 * ATR  ->  R:R 1:1)
 // =============================================================================
 slLong  = close - slMult * atrVal
 tpLong  = close + tpMult * atrVal
@@ -189,13 +197,13 @@ tpShortStr = str.tostring(tpShort, "#.##")
 if longSignal
     msg = '{"symbol":"' + alertSymbol + '","side":"buy","price":' + priceStr +
           ',"sl":' + slLongStr + ',"tp":' + tpLongStr +
-          ',"tf":"' + alertTfLabel + '","strategy":"riskguard_intraday_v1"}'
+          ',"tf":"' + alertTfLabel + '","strategy":"riskguard_intraday_v1_1"}'
     alert(msg, alert.freq_once_per_bar_close)
 
 if shortSignal
     msg = '{"symbol":"' + alertSymbol + '","side":"sell","price":' + priceStr +
           ',"sl":' + slShortStr + ',"tp":' + tpShortStr +
-          ',"tf":"' + alertTfLabel + '","strategy":"riskguard_intraday_v1"}'
+          ',"tf":"' + alertTfLabel + '","strategy":"riskguard_intraday_v1_1"}'
     alert(msg, alert.freq_once_per_bar_close)
 
 // =============================================================================
@@ -214,9 +222,6 @@ plotshape(shortSignal, title = "SHORT", location = location.abovebar,
 
 // =============================================================================
 // DEBUG PANEL
-//   On-chart table (top-right) with the per-filter state on the last bar, plus
-//   per-bar boolean plots routed to the Data Window so historical state can be
-//   inspected bar-by-bar without cluttering the chart.
 // =============================================================================
 f_lbl(b) => b ? "OK" : "--"
 f_bg (b) => b ? color.new(color.green, 70) : color.new(color.red, 80)
