@@ -12,7 +12,7 @@
 // 1h EMA200 and auto-block every signal. EMA200 daily smooths over ~6.6 months
 // and stays well-anchored even through 5 % intraday crashes.
 // =============================================================================
-strategy("RSI Extreme Scalper BTC v3",
+strategy("RSI Extreme Scalper BTC v3 (daily filter)",
      overlay                 = true,
      process_orders_on_close = true,
      initial_capital         = 10000,
@@ -32,17 +32,14 @@ rsiHigh = input.float(85,   "RSI High (short)", minval = 50,   maxval = 99)
 tpPct   = input.float(0.50, "TP %",             minval = 0.01, step   = 0.05)
 slPct   = input.float(0.50, "SL %",             minval = 0.01, step   = 0.05)
 
-htfTimeframe = input.timeframe("D",   "HTF Timeframe")
-htfEmaLen    = input.int      (200,   "HTF EMA Length",  minval = 10)
-
 alertSymbol = input.string("BTCUSDT", "Alert Symbol")
 alertTf     = input.string("15m",     "Alert TF Label")
 
 // =============================================================================
-// HTF TREND  (price vs. EMA — survives short pullbacks)
+// HTF TREND  (DAILY price-vs-EMA200, hardcoded to avoid stale TV input cache)
 // =============================================================================
-htfEma = request.security(syminfo.tickerid, htfTimeframe,
-     ta.ema(close, htfEmaLen), lookahead = barmerge.lookahead_off)
+htfEma = request.security(syminfo.tickerid, "D",
+     ta.ema(close, 200), lookahead = barmerge.lookahead_off)
 
 htfUp = not na(htfEma) and close > htfEma
 htfDn = not na(htfEma) and close < htfEma
