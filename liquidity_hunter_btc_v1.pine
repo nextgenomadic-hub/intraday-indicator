@@ -15,6 +15,11 @@
 //
 // Entry on rejection (wick into zone, close back on the safe side) with
 // optional candle-color confirmation. TP +1.0 %, SL -0.5 %  (R:R 2:1).
+//
+// First-touch only: each zone fires alarm ONLY the first bar it gets swept
+// since the underlying pivot was last updated. Subsequent touches of the same
+// zone are silenced until a new pivot regenerates it. Rationale: virgin levels
+// have higher reaction probability; re-tested levels tend to break.
 // =============================================================================
 strategy("Liquidity Hunter BTC v1",
      overlay                 = true,
@@ -136,26 +141,90 @@ d_gpL  = f_gpLow(lastHD,  lastLD,  useTfD  and useGp)
 d_gpU  = f_gpUp (lastHD,  lastLD,  useTfD  and useGp)
 
 // =============================================================================
-// SWEEP + REJECTION DETECTION
+// SWEEP + REJECTION DETECTION  (first-touch only, per zone)
 // =============================================================================
-touched_short(lvl)        => not na(lvl) and high >= lvl and close < lvl
-touched_long (lvl)        => not na(lvl) and low  <= lvl and close > lvl
-touched_gp_short(lo, up)  => not na(lo)  and not na(up) and high >= lo and close < lo
-touched_gp_long (lo, up)  => not na(lo)  and not na(up) and low  <= up and close > up
+// Each helper keeps its own per-call-site state: a `touched` flag that resets
+// every time the underlying level changes (i.e., a new pivot was detected).
+// Subsequent touches of the same un-updated level return false.
 
-shortSweep = touched_short(h1_s100) or touched_short(h1_s50) or touched_short(h1_s25) or
-             touched_short(h4_s100) or touched_short(h4_s50) or touched_short(h4_s25) or
-             touched_short(d_s100)  or touched_short(d_s50)  or touched_short(d_s25)  or
-             touched_gp_short(h1_gpL, h1_gpU) or
-             touched_gp_short(h4_gpL, h4_gpU) or
-             touched_gp_short(d_gpL,  d_gpU)
+touched_short(lvl) =>
+    var bool tch  = false
+    var float prev = na
+    if not na(lvl) and lvl != prev
+        tch  := false
+        prev := lvl
+    isTouch = not na(lvl) and high >= lvl and close < lvl
+    fire    = isTouch and not tch
+    if isTouch
+        tch := true
+    fire
 
-longSweep  = touched_long(h1_l100) or touched_long(h1_l50) or touched_long(h1_l25) or
-             touched_long(h4_l100) or touched_long(h4_l50) or touched_long(h4_l25) or
-             touched_long(d_l100)  or touched_long(d_l50)  or touched_long(d_l25)  or
-             touched_gp_long(h1_gpL, h1_gpU) or
-             touched_gp_long(h4_gpL, h4_gpU) or
-             touched_gp_long(d_gpL,  d_gpU)
+touched_long(lvl) =>
+    var bool tch  = false
+    var float prev = na
+    if not na(lvl) and lvl != prev
+        tch  := false
+        prev := lvl
+    isTouch = not na(lvl) and low <= lvl and close > lvl
+    fire    = isTouch and not tch
+    if isTouch
+        tch := true
+    fire
+
+touched_gp_short(lo, up) =>
+    var bool tch  = false
+    var float prev = na
+    if not na(lo) and lo != prev
+        tch  := false
+        prev := lo
+    isTouch = not na(lo) and not na(up) and high >= lo and close < lo
+    fire    = isTouch and not tch
+    if isTouch
+        tch := true
+    fire
+
+touched_gp_long(lo, up) =>
+    var bool tch  = false
+    var float prev = na
+    if not na(up) and up != prev
+        tch  := false
+        prev := up
+    isTouch = not na(lo) and not na(up) and low <= up and close > up
+    fire    = isTouch and not tch
+    if isTouch
+        tch := true
+    fire
+
+// Evaluate every touch explicitly so per-zone state updates regardless of
+// short-circuit on the `or` chain below.
+ss1  = touched_short(h1_s100)
+ss2  = touched_short(h1_s50)
+ss3  = touched_short(h1_s25)
+ss4  = touched_short(h4_s100)
+ss5  = touched_short(h4_s50)
+ss6  = touched_short(h4_s25)
+ss7  = touched_short(d_s100)
+ss8  = touched_short(d_s50)
+ss9  = touched_short(d_s25)
+ss10 = touched_gp_short(h1_gpL, h1_gpU)
+ss11 = touched_gp_short(h4_gpL, h4_gpU)
+ss12 = touched_gp_short(d_gpL,  d_gpU)
+
+ls1  = touched_long(h1_l100)
+ls2  = touched_long(h1_l50)
+ls3  = touched_long(h1_l25)
+ls4  = touched_long(h4_l100)
+ls5  = touched_long(h4_l50)
+ls6  = touched_long(h4_l25)
+ls7  = touched_long(d_l100)
+ls8  = touched_long(d_l50)
+ls9  = touched_long(d_l25)
+ls10 = touched_gp_long(h1_gpL, h1_gpU)
+ls11 = touched_gp_long(h4_gpL, h4_gpU)
+ls12 = touched_gp_long(d_gpL,  d_gpU)
+
+shortSweep = ss1 or ss2 or ss3 or ss4 or ss5 or ss6 or ss7 or ss8 or ss9 or ss10 or ss11 or ss12
+longSweep  = ls1 or ls2 or ls3 or ls4 or ls5 or ls6 or ls7 or ls8 or ls9 or ls10 or ls11 or ls12
 
 candleBull = close > open
 candleBear = close < open
