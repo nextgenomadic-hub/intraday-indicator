@@ -1,0 +1,251 @@
+//@version=6
+// =============================================================================
+// Liquidity Hunter BTC v1
+//
+// Marks liquidation pools and golden pockets from 1h / 4h / daily swings, then
+// trades the rejection when price sweeps a zone and closes back outside.
+//
+// Liquidation pools (computed from the latest confirmed pivot per TF):
+//   x100  =>  +/- 1 %   above pivot high = short liquidations
+//             (below pivot low  = long  liquidations)
+//   x50   =>  +/- 2 %
+//   x25   =>  +/- 4 %
+//
+// Golden pocket: 0.618 - 0.65 of the latest pivot-high to pivot-low range.
+//
+// Entry on rejection (wick into zone, close back on the safe side) with
+// optional candle-color confirmation. TP +1.0 %, SL -0.5 %  (R:R 2:1).
+// =============================================================================
+strategy("Liquidity Hunter BTC v1",
+     overlay                 = true,
+     process_orders_on_close = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.04,
+     pyramiding              = 0,
+     calc_on_every_tick      = false)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+g_lp  = "1. Liquidity Pools"
+g_gp  = "2. Golden Pocket"
+g_tf  = "3. Timeframes"
+g_piv = "4. Pivot Detection"
+g_ent = "5. Entry / Exit"
+g_al  = "6. Alerts"
+
+useLp   = input.bool(true, "Use Liquidity Pools",  group = g_lp)
+useX100 = input.bool(true, "Include x100 (±1 %)",  group = g_lp)
+useX50  = input.bool(true, "Include x50  (±2 %)",  group = g_lp)
+useX25  = input.bool(true, "Include x25  (±4 %)",  group = g_lp)
+
+useGp = input.bool(true, "Use Golden Pocket (0.618 - 0.65)", group = g_gp)
+
+useTf1h = input.bool(true, "Use 1h zones", group = g_tf)
+useTf4h = input.bool(true, "Use 4h zones", group = g_tf)
+useTfD  = input.bool(true, "Use 1D zones", group = g_tf)
+
+pivLeft  = input.int(5, "Pivot Left",  group = g_piv, minval = 2)
+pivRight = input.int(5, "Pivot Right", group = g_piv, minval = 2)
+
+tpPct = input.float(1.0, "TP %", group = g_ent, minval = 0.1, step = 0.1)
+slPct = input.float(0.5, "SL %", group = g_ent, minval = 0.1, step = 0.1)
+requireColor = input.bool(true, "Require rejection candle color", group = g_ent,
+     tooltip = "Bullish close for longs, bearish close for shorts.")
+
+alertSymbol = input.string("BTCUSDT", "Alert Symbol", group = g_al)
+alertTf     = input.string("15m",     "Alert TF",     group = g_al)
+
+// =============================================================================
+// HTF PIVOTS  (latest confirmed pivot high/low per timeframe)
+// =============================================================================
+[ph1h, pl1h] = request.security(syminfo.tickerid, "60",
+     [ta.pivothigh(high, pivLeft, pivRight), ta.pivotlow(low, pivLeft, pivRight)],
+     lookahead = barmerge.lookahead_off)
+
+[ph4h, pl4h] = request.security(syminfo.tickerid, "240",
+     [ta.pivothigh(high, pivLeft, pivRight), ta.pivotlow(low, pivLeft, pivRight)],
+     lookahead = barmerge.lookahead_off)
+
+[phD, plD] = request.security(syminfo.tickerid, "D",
+     [ta.pivothigh(high, pivLeft, pivRight), ta.pivotlow(low, pivLeft, pivRight)],
+     lookahead = barmerge.lookahead_off)
+
+var float lastH1h = na
+var float lastL1h = na
+var float lastH4h = na
+var float lastL4h = na
+var float lastHD  = na
+var float lastLD  = na
+
+if not na(ph1h)
+    lastH1h := ph1h
+if not na(pl1h)
+    lastL1h := pl1h
+if not na(ph4h)
+    lastH4h := ph4h
+if not na(pl4h)
+    lastL4h := pl4h
+if not na(phD)
+    lastHD := phD
+if not na(plD)
+    lastLD := plD
+
+// =============================================================================
+// ZONE CALCULATION
+// =============================================================================
+f_short(p, m, on) => on and not na(p) ? p * (1 + m) : na
+f_long (p, m, on) => on and not na(p) ? p * (1 - m) : na
+
+// 1h liquidation pools
+h1_s100 = f_short(lastH1h, 0.01, useTf1h and useLp and useX100)
+h1_s50  = f_short(lastH1h, 0.02, useTf1h and useLp and useX50)
+h1_s25  = f_short(lastH1h, 0.04, useTf1h and useLp and useX25)
+h1_l100 = f_long (lastL1h, 0.01, useTf1h and useLp and useX100)
+h1_l50  = f_long (lastL1h, 0.02, useTf1h and useLp and useX50)
+h1_l25  = f_long (lastL1h, 0.04, useTf1h and useLp and useX25)
+
+// 4h liquidation pools
+h4_s100 = f_short(lastH4h, 0.01, useTf4h and useLp and useX100)
+h4_s50  = f_short(lastH4h, 0.02, useTf4h and useLp and useX50)
+h4_s25  = f_short(lastH4h, 0.04, useTf4h and useLp and useX25)
+h4_l100 = f_long (lastL4h, 0.01, useTf4h and useLp and useX100)
+h4_l50  = f_long (lastL4h, 0.02, useTf4h and useLp and useX50)
+h4_l25  = f_long (lastL4h, 0.04, useTf4h and useLp and useX25)
+
+// 1D liquidation pools
+d_s100 = f_short(lastHD, 0.01, useTfD and useLp and useX100)
+d_s50  = f_short(lastHD, 0.02, useTfD and useLp and useX50)
+d_s25  = f_short(lastHD, 0.04, useTfD and useLp and useX25)
+d_l100 = f_long (lastLD, 0.01, useTfD and useLp and useX100)
+d_l50  = f_long (lastLD, 0.02, useTfD and useLp and useX50)
+d_l25  = f_long (lastLD, 0.04, useTfD and useLp and useX25)
+
+// Golden pockets per TF
+f_gpLow(h, l, on) => on and not na(h) and not na(l) ? l + (h - l) * 0.618 : na
+f_gpUp (h, l, on) => on and not na(h) and not na(l) ? l + (h - l) * 0.65  : na
+
+h1_gpL = f_gpLow(lastH1h, lastL1h, useTf1h and useGp)
+h1_gpU = f_gpUp (lastH1h, lastL1h, useTf1h and useGp)
+h4_gpL = f_gpLow(lastH4h, lastL4h, useTf4h and useGp)
+h4_gpU = f_gpUp (lastH4h, lastL4h, useTf4h and useGp)
+d_gpL  = f_gpLow(lastHD,  lastLD,  useTfD  and useGp)
+d_gpU  = f_gpUp (lastHD,  lastLD,  useTfD  and useGp)
+
+// =============================================================================
+// SWEEP + REJECTION DETECTION
+// =============================================================================
+touched_short(lvl)        => not na(lvl) and high >= lvl and close < lvl
+touched_long (lvl)        => not na(lvl) and low  <= lvl and close > lvl
+touched_gp_short(lo, up)  => not na(lo)  and not na(up) and high >= lo and close < lo
+touched_gp_long (lo, up)  => not na(lo)  and not na(up) and low  <= up and close > up
+
+shortSweep = touched_short(h1_s100) or touched_short(h1_s50) or touched_short(h1_s25) or
+             touched_short(h4_s100) or touched_short(h4_s50) or touched_short(h4_s25) or
+             touched_short(d_s100)  or touched_short(d_s50)  or touched_short(d_s25)  or
+             touched_gp_short(h1_gpL, h1_gpU) or
+             touched_gp_short(h4_gpL, h4_gpU) or
+             touched_gp_short(d_gpL,  d_gpU)
+
+longSweep  = touched_long(h1_l100) or touched_long(h1_l50) or touched_long(h1_l25) or
+             touched_long(h4_l100) or touched_long(h4_l50) or touched_long(h4_l25) or
+             touched_long(d_l100)  or touched_long(d_l50)  or touched_long(d_l25)  or
+             touched_gp_long(h1_gpL, h1_gpU) or
+             touched_gp_long(h4_gpL, h4_gpU) or
+             touched_gp_long(d_gpL,  d_gpU)
+
+candleBull = close > open
+candleBear = close < open
+
+longSignal  = longSweep  and (not requireColor or candleBull)
+shortSignal = shortSweep and (not requireColor or candleBear)
+
+// =============================================================================
+// EXIT LEVELS & ORDERS
+// =============================================================================
+tpLong  = close * (1 + tpPct / 100)
+slLong  = close * (1 - slPct / 100)
+tpShort = close * (1 - tpPct / 100)
+slShort = close * (1 + slPct / 100)
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("LONG",  strategy.long)
+    strategy.exit ("XL", from_entry = "LONG",  stop = slLong,  limit = tpLong)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("SHORT", strategy.short)
+    strategy.exit ("XS", from_entry = "SHORT", stop = slShort, limit = tpShort)
+
+// =============================================================================
+// ALERTS (JSON payload for webhook)
+// =============================================================================
+priceStr   = str.tostring(close,   "#.##")
+slLongStr  = str.tostring(slLong,  "#.##")
+tpLongStr  = str.tostring(tpLong,  "#.##")
+slShortStr = str.tostring(slShort, "#.##")
+tpShortStr = str.tostring(tpShort, "#.##")
+
+if longSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"buy","price":' + priceStr +
+          ',"sl":' + slLongStr + ',"tp":' + tpLongStr +
+          ',"tf":"' + alertTf + '","strategy":"liquidity_hunter_v1"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"sell","price":' + priceStr +
+          ',"sl":' + slShortStr + ',"tp":' + tpShortStr +
+          ',"tf":"' + alertTf + '","strategy":"liquidity_hunter_v1"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+// =============================================================================
+// PLOTS - all zones as horizontal step lines on the chart
+// =============================================================================
+// Colors: daily = bold (low transparency), 4h = medium, 1h = light
+c_red_d  = color.new(color.red,    20)
+c_red_4  = color.new(color.red,    50)
+c_red_1  = color.new(color.red,    70)
+c_grn_d  = color.new(color.green,  20)
+c_grn_4  = color.new(color.green,  50)
+c_grn_1  = color.new(color.green,  70)
+c_ylw_d  = color.new(color.yellow, 20)
+c_ylw_4  = color.new(color.yellow, 50)
+c_ylw_1  = color.new(color.yellow, 70)
+
+// 1h zones
+plot(h1_s100, "1h x100 short", color = c_red_1, style = plot.style_linebr)
+plot(h1_s50,  "1h x50 short",  color = c_red_1, style = plot.style_linebr)
+plot(h1_s25,  "1h x25 short",  color = c_red_1, style = plot.style_linebr)
+plot(h1_l100, "1h x100 long",  color = c_grn_1, style = plot.style_linebr)
+plot(h1_l50,  "1h x50 long",   color = c_grn_1, style = plot.style_linebr)
+plot(h1_l25,  "1h x25 long",   color = c_grn_1, style = plot.style_linebr)
+plot(h1_gpL,  "1h GP lower",   color = c_ylw_1, style = plot.style_linebr)
+plot(h1_gpU,  "1h GP upper",   color = c_ylw_1, style = plot.style_linebr)
+
+// 4h zones
+plot(h4_s100, "4h x100 short", color = c_red_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_s50,  "4h x50 short",  color = c_red_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_s25,  "4h x25 short",  color = c_red_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_l100, "4h x100 long",  color = c_grn_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_l50,  "4h x50 long",   color = c_grn_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_l25,  "4h x25 long",   color = c_grn_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_gpL,  "4h GP lower",   color = c_ylw_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_gpU,  "4h GP upper",   color = c_ylw_4, style = plot.style_linebr, linewidth = 2)
+
+// 1D zones
+plot(d_s100, "1D x100 short", color = c_red_d, style = plot.style_linebr, linewidth = 3)
+plot(d_s50,  "1D x50 short",  color = c_red_d, style = plot.style_linebr, linewidth = 3)
+plot(d_s25,  "1D x25 short",  color = c_red_d, style = plot.style_linebr, linewidth = 3)
+plot(d_l100, "1D x100 long",  color = c_grn_d, style = plot.style_linebr, linewidth = 3)
+plot(d_l50,  "1D x50 long",   color = c_grn_d, style = plot.style_linebr, linewidth = 3)
+plot(d_l25,  "1D x25 long",   color = c_grn_d, style = plot.style_linebr, linewidth = 3)
+plot(d_gpL,  "1D GP lower",   color = c_ylw_d, style = plot.style_linebr, linewidth = 3)
+plot(d_gpU,  "1D GP upper",   color = c_ylw_d, style = plot.style_linebr, linewidth = 3)
+
+// Signal markers
+plotshape(longSignal,  title = "LONG",  location = location.belowbar,
+     color = color.new(color.lime, 0), style = shape.triangleup,   size = size.small, text = "L")
+plotshape(shortSignal, title = "SHORT", location = location.abovebar,
+     color = color.new(color.red,  0), style = shape.triangledown, size = size.small, text = "S")
