@@ -1,0 +1,150 @@
+//@version=6
+// =============================================================================
+// KDJ + Bollinger BTC v1
+//
+// Mean-reversion strategy combining two independent extreme-detection signals:
+//
+//   1. KDJ (9, 3, 3): J line crosses back through an extreme threshold.
+//      LONG  trigger: J crosses UP through 0     (recovery from severe oversold)
+//      SHORT trigger: J crosses DOWN through 100 (recovery from severe overbought)
+//
+//   2. Bollinger Bands (20, 2.0): price reached the outer band recently.
+//      LONG  needs: low  <= lower BB within last N bars
+//      SHORT needs: high >= upper BB within last N bars
+//
+// Both confirmations must be true on the trigger bar, plus optional candle-color
+// filter. Triple confirmation = low frequency, high quality signals.
+//
+// Default TP +1.0 % / SL -0.5 %   (R:R 2:1).
+// =============================================================================
+strategy("KDJ + Bollinger BTC v1",
+     overlay                 = true,
+     process_orders_on_close = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.04,
+     pyramiding              = 0,
+     calc_on_every_tick      = false)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+g_kdj = "1. KDJ"
+g_bb  = "2. Bollinger Bands"
+g_ent = "3. Entry / Exit"
+g_al  = "4. Alerts"
+
+kdjLen  = input.int  (9,   "KDJ Length (N)",            group = g_kdj, minval = 2)
+kdjK    = input.int  (3,   "K Smoothing",               group = g_kdj, minval = 1)
+kdjD    = input.int  (3,   "D Smoothing",               group = g_kdj, minval = 1)
+jLowTh  = input.float(0,   "J Low Threshold (long)",    group = g_kdj)
+jHighTh = input.float(100, "J High Threshold (short)",  group = g_kdj)
+
+bbLen  = input.int  (20,   "BB Length",                 group = g_bb, minval = 2)
+bbMult = input.float(2.0,  "BB Mult (std dev)",         group = g_bb, minval = 0.1, step = 0.1)
+
+lookback     = input.int (3,    "Confluence Lookback (bars)",      group = g_ent, minval = 1,
+     tooltip = "BB outer band touch must have happened within this many bars (including the trigger bar).")
+requireColor = input.bool(true, "Require rejection candle color",  group = g_ent,
+     tooltip = "Bullish close for longs, bearish close for shorts.")
+
+tpPct = input.float(1.0, "TP %", group = g_ent, minval = 0.1, step = 0.1)
+slPct = input.float(0.5, "SL %", group = g_ent, minval = 0.1, step = 0.1)
+
+alertSymbol = input.string("BTCUSDT", "Alert Symbol", group = g_al)
+alertTf     = input.string("15m",     "Alert TF",     group = g_al)
+
+// =============================================================================
+// KDJ
+// =============================================================================
+hh  = ta.highest(high, kdjLen)
+ll  = ta.lowest (low,  kdjLen)
+rng = hh - ll
+rsv = rng > 0 ? 100 * (close - ll) / rng : 50.0
+
+kVal = ta.sma(rsv,  kdjK)
+dVal = ta.sma(kVal, kdjD)
+jVal = 3 * kVal - 2 * dVal
+
+jCrossUp   = ta.crossover (jVal, jLowTh)
+jCrossDown = ta.crossunder(jVal, jHighTh)
+
+// =============================================================================
+// BOLLINGER BANDS
+// =============================================================================
+bbBasis = ta.sma(close, bbLen)
+bbDev   = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+bsLower = ta.barssince(low  <= bbLower)
+bsUpper = ta.barssince(high >= bbUpper)
+
+bbLongOk  = not na(bsLower) and bsLower < lookback
+bbShortOk = not na(bsUpper) and bsUpper < lookback
+
+// =============================================================================
+// SIGNALS
+// =============================================================================
+candleBull = close > open
+candleBear = close < open
+
+longSignal  = jCrossUp   and bbLongOk  and close > bbLower and (not requireColor or candleBull)
+shortSignal = jCrossDown and bbShortOk and close < bbUpper and (not requireColor or candleBear)
+
+// =============================================================================
+// EXIT LEVELS & ORDERS
+// =============================================================================
+tpLong  = close * (1 + tpPct / 100)
+slLong  = close * (1 - slPct / 100)
+tpShort = close * (1 - tpPct / 100)
+slShort = close * (1 + slPct / 100)
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("LONG",  strategy.long)
+    strategy.exit ("XL", from_entry = "LONG",  stop = slLong,  limit = tpLong)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("SHORT", strategy.short)
+    strategy.exit ("XS", from_entry = "SHORT", stop = slShort, limit = tpShort)
+
+// =============================================================================
+// ALERTS  (JSON payload)
+// =============================================================================
+priceStr   = str.tostring(close,   "#.##")
+slLongStr  = str.tostring(slLong,  "#.##")
+tpLongStr  = str.tostring(tpLong,  "#.##")
+slShortStr = str.tostring(slShort, "#.##")
+tpShortStr = str.tostring(tpShort, "#.##")
+
+if longSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"buy","price":' + priceStr +
+          ',"sl":' + slLongStr + ',"tp":' + tpLongStr +
+          ',"tf":"' + alertTf + '","strategy":"kdj_bb_btc_v1"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"sell","price":' + priceStr +
+          ',"sl":' + slShortStr + ',"tp":' + tpShortStr +
+          ',"tf":"' + alertTf + '","strategy":"kdj_bb_btc_v1"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+// =============================================================================
+// PLOTS
+// =============================================================================
+plot(bbUpper, "BB Upper",  color = color.new(color.red,   40), linewidth = 1)
+plot(bbBasis, "BB Middle", color = color.new(color.gray,  50), linewidth = 1)
+plot(bbLower, "BB Lower",  color = color.new(color.green, 40), linewidth = 1)
+
+plotshape(longSignal,  title = "LONG",  location = location.belowbar,
+     color = color.new(color.lime, 0), style = shape.triangleup,   size = size.small, text = "L")
+plotshape(shortSignal, title = "SHORT", location = location.abovebar,
+     color = color.new(color.red,  0), style = shape.triangledown, size = size.small, text = "S")
+
+plot(kVal, "KDJ K", display = display.data_window)
+plot(dVal, "KDJ D", display = display.data_window)
+plot(jVal, "KDJ J", display = display.data_window)
+plot(bsLower, "Bars since BB lower touch", display = display.data_window)
+plot(bsUpper, "Bars since BB upper touch", display = display.data_window)
