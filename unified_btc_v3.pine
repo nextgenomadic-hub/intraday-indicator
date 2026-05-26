@@ -1,0 +1,385 @@
+//@version=6
+// =============================================================================
+// Unified Hunter BTC v3
+//
+// v2 baseline (user-validated winning config) + Support/Resistance as a third
+// signal source. S/R = the pivot levels themselves (the actual swing highs and
+// lows), distinct from the Liquidity Pools which sit at +/-1% from those same
+// pivots.
+//
+// Rule (user-requested): touch a fresh S/R level once = potential bounce, fire
+// signal. Second/third touch = level has been tested, likely to break, skip.
+// Implemented via the same first-touch state machine that already protects the
+// Liquidity Pool signals.
+//
+// Defaults updated to the validated winning config (93.33 % WR, 15 trades,
+// +0.34 % in 2.5 months):
+//   TP  = 0.4 %
+//   SL  = 1.0 %  (R:R 0.4:1 -- wide stop scalper profile, BE WR ~78 %)
+//   Liquidity Pools: x100 only (no x50, no x25)
+//   Golden Pocket: OFF
+//   1h + 4h + 1D zones: ON
+//   RSI Reversal: ON
+//   Require rejection candle color: ON
+//
+// New in v3:
+//   Enable Support/Resistance: ON
+// =============================================================================
+strategy("Unified Hunter BTC v3",
+     overlay                 = true,
+     process_orders_on_close = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.04,
+     pyramiding              = 0,
+     calc_on_every_tick      = false)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+g_src = "0. Signal Sources (master toggles)"
+g_rsi = "1. RSI Reversal"
+g_lp  = "2. Liquidity Pools"
+g_gp  = "3. Golden Pocket"
+g_sr  = "4. Support / Resistance (new in v3)"
+g_tf  = "5. Timeframes (for pools/GP/SR)"
+g_piv = "6. Pivot Detection"
+g_ent = "7. Entry / Exit"
+g_al  = "8. Alerts"
+
+useRsi          = input.bool(true,  "Enable RSI Reversal",      group = g_src)
+useLiquidity    = input.bool(true,  "Enable Liquidity Pools",   group = g_src)
+useGoldenPocket = input.bool(false, "Enable Golden Pocket",     group = g_src)
+useSrTouch      = input.bool(true,  "Enable Support/Resistance",group = g_src)
+
+rsiLen  = input.int  (14,   "RSI Length",              group = g_rsi, minval = 2)
+rsiLow  = input.float(15,   "RSI Low Cross (long)",    group = g_rsi, minval = 1,  maxval = 50)
+rsiHigh = input.float(85,   "RSI High Cross (short)",  group = g_rsi, minval = 50, maxval = 99)
+
+useX100 = input.bool(true,  "Include x100 (±1 %)",  group = g_lp)
+useX50  = input.bool(false, "Include x50  (±2 %)",  group = g_lp)
+useX25  = input.bool(false, "Include x25  (±4 %)",  group = g_lp)
+
+useTf1h = input.bool(true, "Use 1h zones", group = g_tf)
+useTf4h = input.bool(true, "Use 4h zones", group = g_tf)
+useTfD  = input.bool(true, "Use 1D zones", group = g_tf)
+
+pivLeft  = input.int(5, "Pivot Left",  group = g_piv, minval = 2)
+pivRight = input.int(5, "Pivot Right", group = g_piv, minval = 2)
+
+tpPct = input.float(0.4, "TP %", group = g_ent, minval = 0.1, step = 0.1)
+slPct = input.float(1.0, "SL %", group = g_ent, minval = 0.1, step = 0.1)
+requireColor = input.bool(true, "Require rejection candle color", group = g_ent,
+     tooltip = "Bullish close for longs, bearish close for shorts. Applies to all signal sources.")
+
+alertSymbol = input.string("BTCUSDT", "Alert Symbol", group = g_al)
+alertTf     = input.string("15m",     "Alert TF",     group = g_al)
+
+// =============================================================================
+// RSI REVERSAL  (signal source 1)
+// =============================================================================
+rsiVal      = ta.rsi(close, rsiLen)
+rsiLongRev  = ta.crossover (rsiVal, rsiLow)
+rsiShortRev = ta.crossunder(rsiVal, rsiHigh)
+
+// =============================================================================
+// HTF PIVOTS  (used by sources 2, 3, 4)
+// =============================================================================
+[ph1h, pl1h] = request.security(syminfo.tickerid, "60",
+     [ta.pivothigh(high, pivLeft, pivRight), ta.pivotlow(low, pivLeft, pivRight)],
+     lookahead = barmerge.lookahead_off)
+[ph4h, pl4h] = request.security(syminfo.tickerid, "240",
+     [ta.pivothigh(high, pivLeft, pivRight), ta.pivotlow(low, pivLeft, pivRight)],
+     lookahead = barmerge.lookahead_off)
+[phD, plD] = request.security(syminfo.tickerid, "D",
+     [ta.pivothigh(high, pivLeft, pivRight), ta.pivotlow(low, pivLeft, pivRight)],
+     lookahead = barmerge.lookahead_off)
+
+var float lastH1h = na
+var float lastL1h = na
+var float lastH4h = na
+var float lastL4h = na
+var float lastHD  = na
+var float lastLD  = na
+
+if not na(ph1h)
+    lastH1h := ph1h
+if not na(pl1h)
+    lastL1h := pl1h
+if not na(ph4h)
+    lastH4h := ph4h
+if not na(pl4h)
+    lastL4h := pl4h
+if not na(phD)
+    lastHD := phD
+if not na(plD)
+    lastLD := plD
+
+// =============================================================================
+// ZONES
+// =============================================================================
+f_short(p, m, on) => on and not na(p) ? p * (1 + m) : na
+f_long (p, m, on) => on and not na(p) ? p * (1 - m) : na
+f_pass (p, on)    => on and not na(p) ? p : na
+
+// Liquidity pool levels (offset from pivots)
+h1_s100 = f_short(lastH1h, 0.01, useTf1h and useLiquidity and useX100)
+h1_s50  = f_short(lastH1h, 0.02, useTf1h and useLiquidity and useX50)
+h1_s25  = f_short(lastH1h, 0.04, useTf1h and useLiquidity and useX25)
+h1_l100 = f_long (lastL1h, 0.01, useTf1h and useLiquidity and useX100)
+h1_l50  = f_long (lastL1h, 0.02, useTf1h and useLiquidity and useX50)
+h1_l25  = f_long (lastL1h, 0.04, useTf1h and useLiquidity and useX25)
+
+h4_s100 = f_short(lastH4h, 0.01, useTf4h and useLiquidity and useX100)
+h4_s50  = f_short(lastH4h, 0.02, useTf4h and useLiquidity and useX50)
+h4_s25  = f_short(lastH4h, 0.04, useTf4h and useLiquidity and useX25)
+h4_l100 = f_long (lastL4h, 0.01, useTf4h and useLiquidity and useX100)
+h4_l50  = f_long (lastL4h, 0.02, useTf4h and useLiquidity and useX50)
+h4_l25  = f_long (lastL4h, 0.04, useTf4h and useLiquidity and useX25)
+
+d_s100 = f_short(lastHD, 0.01, useTfD and useLiquidity and useX100)
+d_s50  = f_short(lastHD, 0.02, useTfD and useLiquidity and useX50)
+d_s25  = f_short(lastHD, 0.04, useTfD and useLiquidity and useX25)
+d_l100 = f_long (lastLD, 0.01, useTfD and useLiquidity and useX100)
+d_l50  = f_long (lastLD, 0.02, useTfD and useLiquidity and useX50)
+d_l25  = f_long (lastLD, 0.04, useTfD and useLiquidity and useX25)
+
+// Golden pockets per TF
+f_gpLow(h, l, on) => on and not na(h) and not na(l) ? l + (h - l) * 0.618 : na
+f_gpUp (h, l, on) => on and not na(h) and not na(l) ? l + (h - l) * 0.65  : na
+
+h1_gpL = f_gpLow(lastH1h, lastL1h, useTf1h and useGoldenPocket)
+h1_gpU = f_gpUp (lastH1h, lastL1h, useTf1h and useGoldenPocket)
+h4_gpL = f_gpLow(lastH4h, lastL4h, useTf4h and useGoldenPocket)
+h4_gpU = f_gpUp (lastH4h, lastL4h, useTf4h and useGoldenPocket)
+d_gpL  = f_gpLow(lastHD,  lastLD,  useTfD  and useGoldenPocket)
+d_gpU  = f_gpUp (lastHD,  lastLD,  useTfD  and useGoldenPocket)
+
+// Support / Resistance levels (the actual pivots themselves)
+h1_r = f_pass(lastH1h, useTf1h and useSrTouch)
+h1_s = f_pass(lastL1h, useTf1h and useSrTouch)
+h4_r = f_pass(lastH4h, useTf4h and useSrTouch)
+h4_s = f_pass(lastL4h, useTf4h and useSrTouch)
+d_r  = f_pass(lastHD,  useTfD  and useSrTouch)
+d_s  = f_pass(lastLD,  useTfD  and useSrTouch)
+
+// =============================================================================
+// FIRST-TOUCH REJECTION DETECTORS (per call-site state, resets when level changes)
+// =============================================================================
+touched_short(lvl) =>
+    var bool tch  = false
+    var float prev = na
+    if not na(lvl) and lvl != prev
+        tch  := false
+        prev := lvl
+    isTouch = not na(lvl) and high >= lvl and close < lvl
+    fire    = isTouch and not tch
+    if isTouch
+        tch := true
+    fire
+
+touched_long(lvl) =>
+    var bool tch  = false
+    var float prev = na
+    if not na(lvl) and lvl != prev
+        tch  := false
+        prev := lvl
+    isTouch = not na(lvl) and low <= lvl and close > lvl
+    fire    = isTouch and not tch
+    if isTouch
+        tch := true
+    fire
+
+touched_gp_short(lo, up) =>
+    var bool tch  = false
+    var float prev = na
+    if not na(lo) and lo != prev
+        tch  := false
+        prev := lo
+    isTouch = not na(lo) and not na(up) and high >= lo and close < lo
+    fire    = isTouch and not tch
+    if isTouch
+        tch := true
+    fire
+
+touched_gp_long(lo, up) =>
+    var bool tch  = false
+    var float prev = na
+    if not na(up) and up != prev
+        tch  := false
+        prev := up
+    isTouch = not na(lo) and not na(up) and low <= up and close > up
+    fire    = isTouch and not tch
+    if isTouch
+        tch := true
+    fire
+
+// Liquidity pool touches
+ss1  = touched_short(h1_s100)
+ss2  = touched_short(h1_s50)
+ss3  = touched_short(h1_s25)
+ss4  = touched_short(h4_s100)
+ss5  = touched_short(h4_s50)
+ss6  = touched_short(h4_s25)
+ss7  = touched_short(d_s100)
+ss8  = touched_short(d_s50)
+ss9  = touched_short(d_s25)
+
+ls1  = touched_long(h1_l100)
+ls2  = touched_long(h1_l50)
+ls3  = touched_long(h1_l25)
+ls4  = touched_long(h4_l100)
+ls5  = touched_long(h4_l50)
+ls6  = touched_long(h4_l25)
+ls7  = touched_long(d_l100)
+ls8  = touched_long(d_l50)
+ls9  = touched_long(d_l25)
+
+// Golden pocket touches
+gp_s1 = touched_gp_short(h1_gpL, h1_gpU)
+gp_s2 = touched_gp_short(h4_gpL, h4_gpU)
+gp_s3 = touched_gp_short(d_gpL,  d_gpU)
+gp_l1 = touched_gp_long(h1_gpL, h1_gpU)
+gp_l2 = touched_gp_long(h4_gpL, h4_gpU)
+gp_l3 = touched_gp_long(d_gpL,  d_gpU)
+
+// S/R touches (new in v3) - distinct call sites = distinct state
+sr_h1_r = touched_short(h1_r)
+sr_h4_r = touched_short(h4_r)
+sr_d_r  = touched_short(d_r)
+sr_h1_s = touched_long (h1_s)
+sr_h4_s = touched_long (h4_s)
+sr_d_s  = touched_long (d_s)
+
+liqShortSweep = ss1 or ss2 or ss3 or ss4 or ss5 or ss6 or ss7 or ss8 or ss9 or gp_s1 or gp_s2 or gp_s3
+liqLongSweep  = ls1 or ls2 or ls3 or ls4 or ls5 or ls6 or ls7 or ls8 or ls9 or gp_l1 or gp_l2 or gp_l3
+
+srShortSweep = sr_h1_r or sr_h4_r or sr_d_r
+srLongSweep  = sr_h1_s or sr_h4_s or sr_d_s
+
+// =============================================================================
+// UNIFIED SIGNAL  (OR of all enabled sources)
+// =============================================================================
+candleBull = close > open
+candleBear = close < open
+
+rsiSigLong  = useRsi and rsiLongRev  and (not requireColor or candleBull)
+rsiSigShort = useRsi and rsiShortRev and (not requireColor or candleBear)
+liqSigLong  = liqLongSweep  and (not requireColor or candleBull)
+liqSigShort = liqShortSweep and (not requireColor or candleBear)
+srSigLong   = srLongSweep   and (not requireColor or candleBull)
+srSigShort  = srShortSweep  and (not requireColor or candleBear)
+
+longSignal  = rsiSigLong  or liqSigLong  or srSigLong
+shortSignal = rsiSigShort or liqSigShort or srSigShort
+
+// Source tag for the alert payload (priority order: rsi > sr > liq)
+sourceTag(rsi, sr, liq) =>
+    rsi ? "rsi" : sr ? "sr" : liq ? "liq" : ""
+
+longSource  = sourceTag(rsiSigLong,  srSigLong,  liqSigLong)
+shortSource = sourceTag(rsiSigShort, srSigShort, liqSigShort)
+
+// =============================================================================
+// EXIT LEVELS & ORDERS
+// =============================================================================
+tpLong  = close * (1 + tpPct / 100)
+slLong  = close * (1 - slPct / 100)
+tpShort = close * (1 - tpPct / 100)
+slShort = close * (1 + slPct / 100)
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("LONG",  strategy.long)
+    strategy.exit ("XL", from_entry = "LONG",  stop = slLong,  limit = tpLong)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("SHORT", strategy.short)
+    strategy.exit ("XS", from_entry = "SHORT", stop = slShort, limit = tpShort)
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+priceStr   = str.tostring(close,   "#.##")
+slLongStr  = str.tostring(slLong,  "#.##")
+tpLongStr  = str.tostring(tpLong,  "#.##")
+slShortStr = str.tostring(slShort, "#.##")
+tpShortStr = str.tostring(tpShort, "#.##")
+
+if longSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"buy","price":' + priceStr +
+          ',"sl":' + slLongStr + ',"tp":' + tpLongStr +
+          ',"tf":"' + alertTf + '","strategy":"unified_btc_v3"' +
+          ',"source":"' + longSource + '"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortSignal
+    msg = '{"symbol":"' + alertSymbol + '","side":"sell","price":' + priceStr +
+          ',"sl":' + slShortStr + ',"tp":' + tpShortStr +
+          ',"tf":"' + alertTf + '","strategy":"unified_btc_v3"' +
+          ',"source":"' + shortSource + '"}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+// =============================================================================
+// PLOTS - liquidity / GP zones
+// =============================================================================
+c_red_d  = color.new(color.red,    20)
+c_red_4  = color.new(color.red,    50)
+c_red_1  = color.new(color.red,    70)
+c_grn_d  = color.new(color.green,  20)
+c_grn_4  = color.new(color.green,  50)
+c_grn_1  = color.new(color.green,  70)
+c_ylw_d  = color.new(color.yellow, 20)
+c_ylw_4  = color.new(color.yellow, 50)
+c_ylw_1  = color.new(color.yellow, 70)
+
+// Distinct color for S/R (the pivot levels themselves): white/cyan, thicker
+c_sr_d = color.new(color.white,  0)
+c_sr_4 = color.new(color.aqua,  20)
+c_sr_1 = color.new(color.aqua,  50)
+
+plot(h1_s100, "1h x100 short", color = c_red_1, style = plot.style_linebr)
+plot(h1_s50,  "1h x50 short",  color = c_red_1, style = plot.style_linebr)
+plot(h1_s25,  "1h x25 short",  color = c_red_1, style = plot.style_linebr)
+plot(h1_l100, "1h x100 long",  color = c_grn_1, style = plot.style_linebr)
+plot(h1_l50,  "1h x50 long",   color = c_grn_1, style = plot.style_linebr)
+plot(h1_l25,  "1h x25 long",   color = c_grn_1, style = plot.style_linebr)
+plot(h1_gpL,  "1h GP lower",   color = c_ylw_1, style = plot.style_linebr)
+plot(h1_gpU,  "1h GP upper",   color = c_ylw_1, style = plot.style_linebr)
+
+plot(h4_s100, "4h x100 short", color = c_red_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_s50,  "4h x50 short",  color = c_red_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_s25,  "4h x25 short",  color = c_red_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_l100, "4h x100 long",  color = c_grn_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_l50,  "4h x50 long",   color = c_grn_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_l25,  "4h x25 long",   color = c_grn_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_gpL,  "4h GP lower",   color = c_ylw_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_gpU,  "4h GP upper",   color = c_ylw_4, style = plot.style_linebr, linewidth = 2)
+
+plot(d_s100, "1D x100 short", color = c_red_d, style = plot.style_linebr, linewidth = 3)
+plot(d_s50,  "1D x50 short",  color = c_red_d, style = plot.style_linebr, linewidth = 3)
+plot(d_s25,  "1D x25 short",  color = c_red_d, style = plot.style_linebr, linewidth = 3)
+plot(d_l100, "1D x100 long",  color = c_grn_d, style = plot.style_linebr, linewidth = 3)
+plot(d_l50,  "1D x50 long",   color = c_grn_d, style = plot.style_linebr, linewidth = 3)
+plot(d_l25,  "1D x25 long",   color = c_grn_d, style = plot.style_linebr, linewidth = 3)
+plot(d_gpL,  "1D GP lower",   color = c_ylw_d, style = plot.style_linebr, linewidth = 3)
+plot(d_gpU,  "1D GP upper",   color = c_ylw_d, style = plot.style_linebr, linewidth = 3)
+
+// S/R lines (pivots themselves) - in cyan/white, dashed-style via linebr breaks
+plot(h1_r, "1h Resistance", color = c_sr_1, style = plot.style_linebr, linewidth = 1)
+plot(h1_s, "1h Support",    color = c_sr_1, style = plot.style_linebr, linewidth = 1)
+plot(h4_r, "4h Resistance", color = c_sr_4, style = plot.style_linebr, linewidth = 2)
+plot(h4_s, "4h Support",    color = c_sr_4, style = plot.style_linebr, linewidth = 2)
+plot(d_r,  "1D Resistance", color = c_sr_d, style = plot.style_linebr, linewidth = 3)
+plot(d_s,  "1D Support",    color = c_sr_d, style = plot.style_linebr, linewidth = 3)
+
+// Signal markers - one per source type, plus confluence
+plotshape(rsiSigLong,                                                title = "RSI long",  location = location.belowbar, color = color.new(color.aqua,   0), style = shape.diamond,      size = size.tiny)
+plotshape(rsiSigShort,                                               title = "RSI short", location = location.abovebar, color = color.new(color.fuchsia,0), style = shape.diamond,      size = size.tiny)
+plotshape(srSigLong  and not rsiSigLong,                             title = "SR long",   location = location.belowbar, color = color.new(color.white,  0), style = shape.cross,        size = size.small)
+plotshape(srSigShort and not rsiSigShort,                            title = "SR short",  location = location.abovebar, color = color.new(color.white,  0), style = shape.cross,        size = size.small)
+plotshape(liqSigLong  and not rsiSigLong  and not srSigLong,         title = "LIQ long",  location = location.belowbar, color = color.new(color.lime,   0), style = shape.triangleup,   size = size.small, text = "L")
+plotshape(liqSigShort and not rsiSigShort and not srSigShort,        title = "LIQ short", location = location.abovebar, color = color.new(color.red,    0), style = shape.triangledown, size = size.small, text = "S")
+
+plot(rsiVal, "RSI", display = display.data_window)
